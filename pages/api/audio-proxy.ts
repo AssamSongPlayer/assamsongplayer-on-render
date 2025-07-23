@@ -1,57 +1,71 @@
 // /pages/api/audio-proxy.ts
 
 import type { NextApiRequest, NextApiResponse } from 'next'
-import https from 'https'
 
-const token = 'fE93KkZMjhg7ZtHMudQY9CHj5m8MDH3CFxLEKsw1y'
+const AUTH_TOKEN = 'fE93KkZMjhg7ZtHMudQY9CHj5m8MDH3CFxLEKsw1y'
 
-// In-memory link cache: fileid → direct stream URL
+// Optional: in-memory link cache
 const audioLinkCache = new Map<string, string>()
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
-  const { fileid } = req.query
+  const fileid = req.query.fileid as string
 
-  if (!fileid || typeof fileid !== 'string') {
-    return res.status(400).json({ error: 'Missing or invalid fileid' })
+  if (!fileid) {
+    return res.status(400).json({ error: 'Missing fileid' })
   }
 
   try {
-    let streamUrl = audioLinkCache.get(fileid)
+    let fileUrl = audioLinkCache.get(fileid)
 
-    // If not cached, fetch from pCloud
-    if (!streamUrl) {
-      const response = await fetch(`https://api.pcloud.com/getfilelink?fileid=${fileid}&auth=${token}`)
-      const data = await response.json()
+    if (!fileUrl) {
+      const meta = await fetch(`https://api.pcloud.com/getfilelink?fileid=${fileid}&auth=${AUTH_TOKEN}`)
+      const json = await meta.json()
 
-      if (data.result !== 0 || !data.hosts?.length || !data.path) {
-        return res.status(500).json({ error: 'Failed to fetch pCloud link' })
+      if (json.result !== 0 || !json.hosts?.length || !json.path) {
+        return res.status(500).json({ error: 'Failed to fetch pCloud stream link' })
       }
 
-      streamUrl = `https://${data.hosts[0]}${data.path}`
-      audioLinkCache.set(fileid, streamUrl)
+      fileUrl = `https://${json.hosts[0]}${json.path}`
+      audioLinkCache.set(fileid, fileUrl)
     }
 
-    // Proxy the audio from pCloud and stream to client
-    https.get(streamUrl, (pcloudRes) => {
-      if (pcloudRes.statusCode !== 200) {
-        return res.status(pcloudRes.statusCode || 500).end()
-      }
-
-      // Copy headers (minimal, just set mp3 and cache)
-      res.writeHead(200, {
-        'Content-Type': 'audio/mpeg',
-        'Cache-Control': 'public, max-age=3600',
-      })
-
-      // Pipe audio from pCloud to client
-      pcloudRes.pipe(res)
-    }).on('error', (err) => {
-      console.error('Streaming error:', err)
-      res.status(500).end('Failed to stream audio')
+    // Fetch audio as stream
+    const audioRes = await fetch(fileUrl, {
+      headers: {
+        // Pass through range headers for seeking
+        range: req.headers.range || '',
+      },
     })
+
+    // Forward all headers needed for media playback
+    res.status(audioRes.status)
+    audioRes.headers.forEach((value, key) => {
+      res.setHeader(key, value)
+    })
+
+    // Pipe stream to client
+    if (!audioRes.body) {
+      return res.status(500).end('No audio body')
+    }
+
+    const reader = audioRes.body.getReader()
+    const encoder = new TextEncoder()
+
+    res.setHeader('Cache-Control', 'public, max-age=3600')
+
+    const push = async () => {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (value) res.write(Buffer.from(value))
+      }
+      res.end()
+    }
+
+    push()
 
   } catch (err) {
     console.error('Audio proxy error:', err)
-    res.status(500).json({ error: 'Internal server error' })
+    return res.status(500).json({ error: 'Internal server error' })
   }
 }
